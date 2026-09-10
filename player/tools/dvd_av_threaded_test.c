@@ -42,6 +42,8 @@
 
 #define _GNU_SOURCE
 
+#include "subtitle_blend_cache.h"
+
 #include <dvdnav/dvdnav.h>
 #include <dvdnav/dvdnav_events.h>
 #include <dvdread/dvd_reader.h>
@@ -2981,6 +2983,7 @@ struct Player {
     int subtitle_dvdnav_enabled;  /* authored SPRM2 display-on */
     int subtitle_enabled;         /* effective compose gate */
     AVFrame *yuv_sub_scratch;
+    SubtitleBlendCache subtitle_cache;
     int yuv_sub_algo_logged;
     int yuv_hli_algo_logged;
     int yuv_meta_logged;
@@ -7679,6 +7682,12 @@ static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
     idx = p->msub.idx;
     movie_sub_state_at(p, pvpts_us, color, alpha, &chg);
     movie_sub_note_state(p, 1, color, alpha, chg, pvpts_us);
+    if (!chg) {
+        uint32_t palette[4];
+        for (int code = 0; code < 4; code++)
+            palette[code] = clut[color[code] & 15];
+        subtitle_cache_prepare(&p->subtitle_cache, palette, alpha);
+    }
     max_h = player_active_h(p);
     if (dst->height > 0 && dst->height < max_h)
         max_h = dst->height;
@@ -7743,7 +7752,11 @@ static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
                 len = ax1 - ax0 + 1;
                 if (a8 >= 255)
                     memset(yline + ax0, (uint8_t)ys, (size_t)len);
-                else {
+                else if (!chg) {
+                    const uint8_t *lut = p->subtitle_cache.luma[code];
+                    for (int px = ax0; px <= ax1; px++)
+                        yline[px] = lut[yline[px]];
+                } else {
                     int px;
 
                     for (px = ax0; px <= ax1; px++)
@@ -7775,6 +7788,17 @@ static int movie_sub_overlay_yuv(Player *p, AVFrame *dst, int64_t pvpts_us,
             for (cx = cx0; cx <= cx1; cx++) {
                 int dy, dx, a_sum = 0, cb_wsum = 0, cr_wsum = 0;
                 uint8_t *up, *vp;
+
+                /* Interior blocks with uniform palette/alpha use one lookup;
+                 * partial edge blocks and CHG_COLCON retain the original path. */
+                if (!chg && cx * 2 + 1 < FB_W &&
+                    (dst->width <= 0 || cx * 2 + 1 < dst->width) &&
+                    y * 2 + 1 < max_h &&
+                    subtitle_cache_chroma(&p->subtitle_cache, idx, w, h,
+                        cx * 2 - x0, y * 2 - y0,
+                        dst->data[1] + (size_t)y * dst->linesize[1] + cx,
+                        dst->data[2] + (size_t)y * dst->linesize[2] + cx))
+                    continue;
 
                 for (dy = 0; dy < 2; dy++) {
                     int py = y * 2 + dy;
@@ -7951,27 +7975,25 @@ static int menu_overlay_composite_yuv(Player *p, AVFrame *dst, int frame_menu,
     return 1;
 }
 
-static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
+static int fpga_yuv_prepare_planes(Player *p, AVFrame *frame, const AVFrame **prepared,
                                    int64_t vpts_us, int frame_menu,
                                    int *sub_active, int64_t *sub_blend_us,
-                                   int64_t *copy_us, int64_t *scratch_copy_us,
+                                   int64_t *scratch_copy_us,
                                    int64_t *compose_us)
 {
     const AVFrame *src = frame;
-    int64_t t0, t1, t_copy1, t_comp = 0;
+    int64_t t0, t_copy1, t_comp = 0;
     int blended = 0;
 
     if (sub_active)
         *sub_active = 0;
     if (sub_blend_us)
         *sub_blend_us = 0;
-    if (copy_us)
-        *copy_us = 0;
     if (scratch_copy_us)
         *scratch_copy_us = 0;
     if (compose_us)
         *compose_us = 0;
-    if (!p || !frame || !slot)
+    if (!p || !frame || !prepared)
         return -1;
 
     /*
@@ -8036,12 +8058,30 @@ static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
         }
     }
 
+    *prepared = src;
+    return 0;
+}
+
+/* Legacy/menu callers retain preparation after the ownership wait. */
+static int fpga_yuv_present_planes(Player *p, AVFrame *frame, uint8_t *slot,
+                                   int64_t vpts_us, int frame_menu,
+                                   int *sub_active, int64_t *sub_blend_us,
+                                   int64_t *copy_us, int64_t *scratch_copy_us,
+                                   int64_t *compose_us)
+{
+    const AVFrame *src;
+    int64_t t0;
+    if (copy_us)
+        *copy_us = 0;
+    if (fpga_yuv_prepare_planes(p, frame, &src, vpts_us, frame_menu,
+                               sub_active, sub_blend_us, scratch_copy_us,
+                               compose_us) < 0)
+        return -1;
     t0 = av_gettime_relative();
     if (copy_yuv420_to_slot(slot, src, player_active_h(p)) < 0)
         return -1;
-    t1 = av_gettime_relative();
     if (copy_us)
-        *copy_us = t1 - t0;
+        *copy_us = av_gettime_relative() - t0;
     return 0;
 }
 
@@ -13724,6 +13764,8 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int skip_sws = p->perf_present_no_convert &&
                    (p->iso_warm_presents >= ISO_WARM_PRESENTS);
 
+    if (frame_nav_gen != player_nav_gen(p))
+        return 1;
     if (player_accept_video_frame(p, frame, NULL) < 0)
         return -1;
 
@@ -13752,7 +13794,7 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     if (p->rendered == 0) {
         int64_t T0 = frame_duration_us(p);
         dbg("\n=== VIDEO CONSUMER (YUV queue → direct DDR sws) ===\n"
-            "Path: queue pop → stale-check → ACK wait → "
+            "Path: queue pop → stale-check → "
             "%s → barrier → PTS +2ms → mailbox\n"
             "Video pipeline: BUFFERED YUV producer / direct-DDR sws "
             "consumer\n"
@@ -13763,11 +13805,11 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
             "sws CPU: %s\n",
             p->fpga_yuv420
                 ? (p->fpga_yuv420_subtitles
-                       ? "cached-YUV subtitle compose (if ON) + plane copy"
-                       : "copy YUV planes to DDR")
+                       ? "cached-YUV movie subtitle prepare → ACK wait → plane copy"
+                       : "ACK wait → copy YUV planes to DDR")
                 : p->perf_present_no_convert
-                ? "warmup sws then skip convert"
-                : "sws YUV DIRECT DDR",
+                ? "ACK wait → warmup sws then skip convert"
+                : "ACK wait → sws YUV DIRECT DDR",
             T0 / 1000.0,
             T0 > 0 ? (EARLY_SLACK_US - T0) / 1000.0 : 0.0,
             p->initial_skip_req, p->initial_skip_req == 1 ? "" : "s",
@@ -13790,6 +13832,30 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
 
     int64_t prev_mbox_us = p->last_present_end_us;
     int64_t cycle_t0 = av_gettime_relative();
+    int sub_active = 0;
+    int64_t sub_blend_us = 0;
+    int64_t sub_scratch_us = 0;
+    int64_t sub_compose_us = 0;
+    int64_t sub_prepare_us = 0;
+    const AVFrame *prepared = NULL;
+    int prepared_subtitles = __atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED);
+    /* Work only in cached RAM while the previous display request is in flight.
+     * Do not choose or touch the next DDR buffer until after its ACK. */
+    if (p->fpga_yuv420 && !skip_clock && !frame_menu && !p->in_menu &&
+        !p->interactive_still) {
+        int64_t prepare_t0 = av_gettime_relative();
+        int ret;
+        phase_sws_enter(p);
+        ret = fpga_yuv_prepare_planes(p, frame, &prepared, vpts_us, frame_menu,
+                                     &sub_active, &sub_blend_us,
+                                     &sub_scratch_us, &sub_compose_us);
+        phase_sws_leave(p);
+        sub_prepare_us = av_gettime_relative() - prepare_t0;
+        if (ret < 0) {
+            player_abort(p);
+            return -1;
+        }
+    }
     int64_t ack_wait_us = 0;
     int ack_instant = 0;
     int ack_waited = 0;
@@ -13828,19 +13894,30 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
     int64_t c0 = av_gettime_relative();
     int64_t sws_wall = 0;
     int64_t cpu1 = -1;
-    int sub_active = 0;
-    int64_t sub_blend_us = 0;
-    int64_t sub_scratch_us = 0;
-    int64_t sub_compose_us = 0;
 
     if (p->fpga_yuv420) {
         int64_t copy_us = 0;
 
         log_yuv_frame_meta_once(p, frame);
         phase_sws_enter(p);
-        if (fpga_yuv_present_planes(p, frame, dst_data[0], vpts_us, frame_menu,
+        int copy_ret;
+        if (prepared && frame_nav_gen != player_nav_gen(p)) {
+            phase_sws_leave(p);
+            return 1;
+        }
+        if (prepared && prepared_subtitles ==
+                __atomic_load_n(&p->subtitle_enabled, __ATOMIC_RELAXED)) {
+            int64_t copy_t0 = av_gettime_relative();
+            copy_ret = copy_yuv420_to_slot(dst_data[0], prepared, player_active_h(p));
+            copy_us = av_gettime_relative() - copy_t0;
+        } else {
+            /* An on/off toggle during the wait must not display the old state. */
+            copy_ret = fpga_yuv_present_planes(p, frame, dst_data[0], vpts_us, frame_menu,
                                     &sub_active, &sub_blend_us, &copy_us,
-                                    &sub_scratch_us, &sub_compose_us) < 0) {
+                                    &sub_scratch_us, &sub_compose_us);
+        }
+        if (copy_ret < 0) {
+            phase_sws_leave(p);
             fprintf(stderr, "FAIL: FPGA YUV420 plane copy\n");
             player_abort(p);
             return -1;
@@ -14076,6 +14153,12 @@ static int present_yuv_frame(Player *p, AVFrame *frame, int64_t vpts_us,
 
     if (!p->perf_present_no_convert && !skip_clock && p->rendered > 0 &&
         (p->rendered % PRESENT_PERF_INTERVAL) == 0) {
+        if (p->fpga_yuv420)
+            fprintf(stderr, "SUBTITLE PRESENT: active=%d prepare_before_ack_us=%" PRId64
+                    " scratch_copy_us=%" PRId64 " compose_us=%" PRId64
+                    " display_copy_us=%" PRId64 " ack_wait_us=%" PRId64 "\n",
+                    sub_active, sub_prepare_us, sub_scratch_us, sub_compose_us,
+                    sws_wall, ack_wait_us);
         log_present_perf(p, vpts_us, pvpts_us, decision_aclk, decision_delta,
                          ack_wait_us, ack_instant, sws_wall, post_sws_wait_us,
                          p->last_path.cycle_us,
