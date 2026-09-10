@@ -3221,6 +3221,8 @@ struct Player {
         int cur;       /* index into plane[], -1 if none presented */
         int last_slot; /* last enqueued slot, -1 none */
         MsubDecoded plane[MSUB_Q_CAP];
+        MsubDecoded staging; /* demux-owned; never read by the presenter */
+        unsigned decode_epoch; /* protected by mu; invalidates staged SPUs */
         unsigned long q_drop;
         int64_t max_ahead_us;
         int saw_chg_colcon;
@@ -4206,6 +4208,10 @@ static void navq_destroy(Player *p)
     }
     free(p->msub.acc);
     p->msub.acc = NULL;
+    free(p->msub.staging.idx);
+    p->msub.staging.idx = NULL;
+    free(p->msub.staging.runs);
+    p->msub.staging.runs = NULL;
     if (p->pause.inited) {
         pthread_mutex_destroy(&p->pause.mu);
         pthread_cond_destroy(&p->pause.cv);
@@ -5736,16 +5742,16 @@ static int movie_sub_ensure_bufs(Player *p)
         if (!p->msub.acc)
             return -1;
     }
-    for (i = 0; i < MSUB_Q_CAP; i++) {
-        if (!p->msub.plane[i].idx) {
-            p->msub.plane[i].idx = malloc(SPU_IDX_MAX);
-            if (!p->msub.plane[i].idx)
+    for (i = 0; i <= MSUB_Q_CAP; i++) {
+        MsubDecoded *s = i == MSUB_Q_CAP ? &p->msub.staging : &p->msub.plane[i];
+        if (!s->idx) {
+            s->idx = malloc(SPU_IDX_MAX);
+            if (!s->idx)
                 return -1;
         }
-        if (!p->msub.plane[i].runs) {
-            p->msub.plane[i].runs = malloc((size_t)MSUB_RUN_MAX *
-                                           sizeof(MsubRun));
-            if (!p->msub.plane[i].runs)
+        if (!s->runs) {
+            s->runs = malloc((size_t)MSUB_RUN_MAX * sizeof(MsubRun));
+            if (!s->runs)
                 return -1;
         }
     }
@@ -5793,6 +5799,7 @@ static void movie_sub_q_flush(Player *p)
 {
     int i;
 
+    p->msub.decode_epoch++;
     for (i = 0; i < MSUB_Q_CAP; i++)
         p->msub.plane[i].occupied = 0;
     p->msub.cur = -1;
@@ -6511,7 +6518,8 @@ static void movie_sub_sync_present(Player *p, int64_t now_us)
         movie_sub_clear_current(p, now_us, aclk);
 }
 
-static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk)
+static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk,
+                                   int depth)
 {
     int64_t ahead = 0;
 
@@ -6523,7 +6531,7 @@ static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk)
             " q=%d/%d first_contr=%u/%u/%u/%u source=%s\n",
             s->id, s->packet_pts_us, s->first_start_delay_us, s->from_us,
             s->final_stop_delay_us, s->until_us, s->w, s->h, s->x, s->y,
-            s->evt_n, aclk, movie_sub_q_depth(p), MSUB_Q_CAP,
+            s->evt_n, aclk, depth, MSUB_Q_CAP,
             s->first_alpha[0] & 0xf, s->first_alpha[1] & 0xf,
             s->first_alpha[2] & 0xf, s->first_alpha[3] & 0xf,
             s->first_contr_src ? "SET_CONTR" : "default{0,0,0,0}");
@@ -6532,6 +6540,54 @@ static void movie_sub_log_enqueue(Player *p, const MsubDecoded *s, int64_t aclk)
         ahead = s->from_us - aclk;
     if (ahead > p->msub.max_ahead_us)
         p->msub.max_ahead_us = ahead;
+}
+
+/* Publish only a complete private decode. No bitmap work or logging under mu.
+ * Recycle the free slot's storage back to the demux-owned staging plane. */
+static int movie_sub_publish_decoded(Player *p, MsubDecoded *s,
+                                      unsigned epoch, unsigned nav_gen,
+                                      int64_t *aclk_out, int *depth_out,
+                                      int64_t *wait_us, int64_t *hold_us)
+{
+    int slot, i, ret = 0;
+    uint8_t *keep_idx;
+    MsubRun *keep_runs;
+    int64_t t0 = av_gettime_relative(), t1;
+
+    pthread_mutex_lock(&p->msub.mu);
+    t1 = av_gettime_relative();
+    *wait_us = t1 - t0;
+    *aclk_out = clock_read(&p->clock, NULL, NULL);
+    if (epoch != p->msub.decode_epoch || nav_gen != player_nav_gen(p))
+        goto done;
+    slot = movie_sub_slot_free_index(p);
+    if (slot < 0) {
+        for (i = 0; i < MSUB_Q_CAP; i++) {
+            if (i != p->msub.cur &&
+                movie_sub_slot_expired(&p->msub.plane[i], *aclk_out))
+                movie_sub_slot_release(&p->msub.plane[i]);
+        }
+        slot = movie_sub_slot_free_index(p);
+    }
+    if (slot < 0) {
+        p->msub.q_drop++;
+        ret = -1;
+        goto done;
+    }
+    keep_idx = p->msub.plane[slot].idx;
+    keep_runs = p->msub.plane[slot].runs;
+    p->msub.plane[slot] = *s;
+    p->msub.plane[slot].occupied = 1;
+    s->idx = keep_idx;
+    s->runs = keep_runs;
+    p->msub.last_slot = slot;
+    movie_sub_snapshot_decoded(p, &p->msub.plane[slot]);
+    *depth_out = movie_sub_q_depth(p);
+    ret = 1;
+done:
+    *hold_us = av_gettime_relative() - t1;
+    pthread_mutex_unlock(&p->msub.mu);
+    return ret;
 }
 
 static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
@@ -6549,6 +6605,8 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
     int saw_chg = 0, evt_n = 0, chg_n = 0;
     MsubEvt evts[MSUB_EVT_MAX];
     MsubChg chgs[MSUB_CHG_MAX];
+    unsigned decode_epoch, decode_nav_gen;
+    int decode_pes_id, decode_logical, decode_physical;
 
     if (buf_size < 10 || AV_RB16(buf) == 0)
         return -1;
@@ -6558,6 +6616,14 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
     cmd_pos = AV_RB16(buf + 2);
     if (cmd_pos < 4 || cmd_pos > buf_size - 4)
         return -1;
+
+    pthread_mutex_lock(&p->msub.mu);
+    decode_epoch = p->msub.decode_epoch;
+    decode_nav_gen = player_nav_gen(p);
+    decode_pes_id = p->msub.pes_id;
+    decode_logical = p->msub.logical;
+    decode_physical = p->msub.chosen_physical;
+    pthread_mutex_unlock(&p->msub.mu);
 
     spu_id = ++p->msub.spu_seq;
     memset(evts, 0, sizeof(evts));
@@ -6657,36 +6723,16 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
         w = x2 - x1 + 1;
         h = y2 - y1 + 1;
         if (w > 0 && h > 1 && w <= FB_W && h <= FB_H) {
-            MsubDecoded *s;
+            MsubDecoded *s = &p->msub.staging;
             uint8_t *keep_idx;
             MsubRun *keep_runs;
-            int slot, i;
+            int published, depth = 0;
             int64_t aclk, start_delay, stop_delay;
+            int64_t decode_t0, decode_us, publish_wait_us, publish_hold_us;
 
             if (movie_sub_ensure_bufs(p) < 0)
                 return -1;
-            pthread_mutex_lock(&p->msub.mu);
-            aclk = clock_read(&p->clock, NULL, NULL);
-            slot = movie_sub_slot_free_index(p);
-            if (slot < 0) {
-                for (i = 0; i < MSUB_Q_CAP; i++) {
-                    if (i == p->msub.cur)
-                        continue;
-                    if (movie_sub_slot_expired(&p->msub.plane[i], aclk))
-                        movie_sub_slot_release(&p->msub.plane[i]);
-                }
-                slot = movie_sub_slot_free_index(p);
-            }
-            if (slot < 0) {
-                p->msub.q_drop++;
-                pthread_mutex_unlock(&p->msub.mu);
-                fprintf(stderr,
-                        "SPU DROP id=%u q_full=%d aclk=%" PRId64
-                        " start would be pts=%" PRId64 "\n",
-                        spu_id, MSUB_Q_CAP, aclk, packet_pts_us);
-                return -1;
-            }
-            s = &p->msub.plane[slot];
+            decode_t0 = av_gettime_relative();
             keep_idx = s->idx;
             keep_runs = s->runs;
             memset(s, 0, sizeof(*s));
@@ -6697,7 +6743,6 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
                 menu_spu_decode_rle(s->idx + w, w * 2, w, h / 2,
                                     buf, offset2, buf_size) < 0) {
                 movie_sub_slot_release(s);
-                pthread_mutex_unlock(&p->msub.mu);
                 return -1;
             }
             start_delay = (first_start_date >= 0)
@@ -6709,9 +6754,9 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
             s->id = spu_id;
             s->valid = 1;
             s->forced = forced;
-            s->pes_id = p->msub.pes_id;
-            s->logical = p->msub.logical;
-            s->chosen_physical = p->msub.chosen_physical;
+            s->pes_id = decode_pes_id;
+            s->logical = decode_logical;
+            s->chosen_physical = decode_physical;
             s->x = x1;
             s->y = y1;
             s->w = w;
@@ -6744,11 +6789,9 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
             movie_sub_crop_ever_visible(s);
             movie_sub_build_runs(s, s->w, s->h);
             movie_sub_count_vis_runs(s);
-            s->occupied = 1;
-            p->msub.last_slot = slot;
-            movie_sub_snapshot_decoded(p, s);
+            decode_us = av_gettime_relative() - decode_t0;
+            /* Diagnostic output can block too; keep it outside the queue lock. */
             movie_sub_log_timeline(s);
-            movie_sub_log_enqueue(p, s, aclk);
             if (p->msub.decoded_spus < MSUB_DAREA_LOG) {
                 fprintf(stderr,
                         "SPU CROP: authored DAREA %dx%d @ (%d,%d) "
@@ -6763,7 +6806,23 @@ static int movie_sub_decode_unit(Player *p, const uint8_t *buf, int buf_size,
                         s->run_n, s->vis_run_n,
                         s->run_overflow ? "yes" : "no");
             }
-            pthread_mutex_unlock(&p->msub.mu);
+            published = movie_sub_publish_decoded(p, s, decode_epoch, decode_nav_gen,
+                                                   &aclk, &depth,
+                                                   &publish_wait_us, &publish_hold_us);
+            fprintf(stderr, "SUBTITLE DECODE: id=%u decode_us=%" PRId64
+                    " publish_wait_us=%" PRId64 " publish_hold_us=%" PRId64
+                    " published=%d\n", spu_id, decode_us, publish_wait_us,
+                    publish_hold_us, published);
+            if (!published) {
+                fprintf(stderr, "SPU DROP id=%u obsolete decode after reset\n", spu_id);
+                return 0;
+            }
+            if (published < 0) {
+                fprintf(stderr, "SPU DROP id=%u q_full=%d aclk=%" PRId64 "\n",
+                        spu_id, MSUB_Q_CAP, aclk);
+                return -1;
+            }
+            movie_sub_log_enqueue(p, s, aclk, depth);
             p->msub.decoded_spus++;
             p->msub.bbox_w_sum += (unsigned)(s->w > 0 ? s->w : 0);
             p->msub.bbox_h_sum += (unsigned)(s->h > 0 ? s->h : 0);

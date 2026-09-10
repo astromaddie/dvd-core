@@ -5,6 +5,41 @@ buffered FPGA YUV420 path. It retains the 128-packet audio queue experiment.
 Hardware playback validation is pending; a successful cross-build does not prove
 that this fixes the reported stutter.
 
+## Revision 2: remove subtitle decode from the presentation lock
+
+The first candidate's device log still shows severe intermittent stalls. At
+raw video PTS 47.8615 seconds, `prepare_before_ack_us=139185`, while scratch copy
+and composition take only 1218 and 5942 microseconds. The remaining roughly
+132 ms is outside those two measurements, and the stall follows a subtitle
+enqueue. Another stale-drop burst reports a previous frame cycle of 357595 us
+with only 3 us ACK wait and 11938 us final display copy. Video remains queued.
+This strongly implicates blocking in subtitle preparation; the first candidate
+did not measure mutex waiting directly and cannot prove the exact breakdown.
+
+Source inspection shows the demux thread holding `msub.mu` across RLE decoding,
+full authored-bitmap analysis, cropping, run construction and diagnostic output.
+Both subtitle visibility checks and composition on the presentation thread
+need that lock. Revision 2 performs that work in a demux-owned staging plane,
+then publishes the completed metadata and swaps bitmap/run buffers during a
+short critical section. It adds one reusable plane (about 0.5 MiB), not another
+thread. Queue capacity and the first candidate's blending/presentation changes
+remain unchanged. Navigation generations and a subtitle-reset epoch reject
+obsolete staged work. The current displayed subtitle is never recycled by
+the publisher. A full queue retains the existing drop behavior.
+
+`SUBTITLE DECODE` now records decode/analysis time, publication lock wait, and
+publication lock hold time. Timeline and enqueue output run outside that lock.
+Compare these with `SUBTITLE PRESENT` and stale drops in the next device log.
+The enqueue log's `aclk_at_decode` field now samples the clock at publication,
+after decoding, rather than before bitmap decoding.
+
+Run `python3 player/tools/test_subtitle_publish.py` for native tests of the
+actual production publication helper, with a minimal player/clock harness.
+Address/undefined-behavior sanitizers cover buffer ownership, full and expired
+queues, reset/navigation invalidation, a concurrent presenter holding the lock,
+and 1000 storage reuse cycles. These are queue-publication tests, not hardware
+playback or full subtitle-decoder tests.
+
 ## Evidence and proposed change
 
 In the supplied on/off log, one approximately 21-second subtitles-off interval
