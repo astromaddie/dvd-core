@@ -5,6 +5,41 @@ buffered FPGA YUV420 path. It retains the 128-packet audio queue experiment.
 Hardware playback validation is pending; a successful cross-build does not prove
 that this fixes the reported stutter.
 
+## Revision 3: clear inherited single-CPU affinity
+
+The next device log showed almost-empty decoded-video queues even with subtitles
+off, while the publication lock added in revision 2 held for only tens of
+microseconds. Inspection of `/proc/<pid>/task/*/status` on the user's SuperStation
+found all five standalone player threads restricted to CPU 1. MiSTer_DVD's main
+thread was also pinned there, while CPU 0 was online. The player's old
+"unpinned" diagnostics only reported its current CPU; they never cleared the
+launcher-inherited affinity mask.
+
+A live test changed only the running player's thread affinity from mask 2 to
+mask 3 (CPUs 0 and 1). The user reported smoother subtitles and more responsive
+menu navigation. Subsequent movie samples showed 23-25/25 queued video frames,
+roughly 29-30 fps and no audio underruns in the new test segment. Three additional
+stale drops appeared between the later 10- and 20-second reports: this is
+encouraging single-device evidence, not proof of hitch-free playback on all DVDs.
+The pause-spanning FPS sample and long menu interval are not movie benchmarks.
+
+Revision 3 restores eligibility on configured CPUs before creating workers in
+buffered FPGA-YUV playback. The kernel still enforces online/cpuset restrictions.
+The launcher and other services are unchanged, and benchmark/other video paths
+retain their existing affinity behavior. A failure logs a warning and playback
+continues. The startup log reports `SCHED: player CPU eligibility 1 -> 2 CPUs`
+when correcting the observed restriction. Already unrestricted launches may
+report `2 -> 2`. Worker diagnostics now describe the inherited player mask.
+
+`player/tools/test_player_cpu_affinity.c` exercises the actual helper on Linux.
+It passed on the user's SuperStation as a separate ARM process: recovery from
+each single-CPU mask, worker-thread inheritance and repeated setup. The test
+restored its own initial affinity and left the SSH parent mask unchanged.
+The revised full player still needs a restart test and longer playback coverage.
+Include `player_cpu_affinity.h` beside the player source when rebuilding.
+
+Reference: [Linux CPU-affinity inheritance](https://man7.org/linux/man-pages/man2/sched_setaffinity.2.html).
+
 ## Revision 2: remove subtitle decode from the presentation lock
 
 The first candidate's device log still shows severe intermittent stalls. At

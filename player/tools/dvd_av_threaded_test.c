@@ -43,6 +43,7 @@
 #define _GNU_SOURCE
 
 #include "subtitle_blend_cache.h"
+#include "player_cpu_affinity.h"
 
 #include <dvdnav/dvdnav.h>
 #include <dvdnav/dvdnav_events.h>
@@ -10316,10 +10317,10 @@ static void snapshot_available_cpus(Player *p)
     p->sched_input_cpu = -1;
 }
 
-static void note_unpinned_cpu(const char *name, int *got_cpu)
+static void note_inherited_cpu(const char *name, int *got_cpu)
 {
     *got_cpu = read_sched_cpu();
-    dbg("sched: %s unpinned (sched_getcpu=%d)\n", name, *got_cpu);
+    dbg("sched: %s inherits player affinity (sched_getcpu=%d)\n", name, *got_cpu);
 }
 
 static unsigned dvd_std_to_fpga_src(DvdVideoStd std)
@@ -10374,7 +10375,7 @@ static void *input_thread(void *opaque)
     int64_t t0 = av_gettime_relative();
 
     memset(&pad, 0, sizeof(pad));
-    note_unpinned_cpu("input", &p->sched_input_cpu);
+    note_inherited_cpu("input", &p->sched_input_cpu);
     fprintf(stderr, "DVD menu navigation: enabled\n");
     fprintf(stderr, "Hold CANCEL/B 3000 ms to return to launcher.\n");
     fprintf(stderr,
@@ -11092,7 +11093,7 @@ static void *audio_thread(void *opaque)
     int64_t first_pts_us = AV_NOPTS_VALUE;
     unsigned clock_epoch = 0;
 
-    note_unpinned_cpu("audio", &p->sched_audio_cpu);
+    note_inherited_cpu("audio", &p->sched_audio_cpu);
 
     memset(&mr, 0, sizeof(mr));
     mr.wr_fd = -1;
@@ -14259,7 +14260,7 @@ static void *present_thread(void *opaque)
     unsigned seen_gen;
     unsigned menu_hold_gen = 0;
 
-    note_unpinned_cpu("present", &p->sched_present_cpu);
+    note_inherited_cpu("present", &p->sched_present_cpu);
 
     menu_hold = av_frame_alloc();
     prefill_wait(p);
@@ -14837,7 +14838,7 @@ static void *video_thread(void *opaque)
     int timed = 0;
     int ready_logged = 0;
 
-    note_unpinned_cpu("video", &p->sched_video_cpu);
+    note_inherited_cpu("video", &p->sched_video_cpu);
 
     p->present_vbl = -1;
     p->first_genuine_pts = AV_NOPTS_VALUE;
@@ -15803,12 +15804,24 @@ int main(int argc, char **argv)
     navq_init(&p);
     movie_sub_recompute_enabled(&p, "startup");
     d.player = &p;
+    if (p.buffered_yuv && p.fpga_yuv420) {
+        cpu_set_t before, after;
+
+        if (player_allow_configured_cpus(&before, &after) < 0) {
+            fprintf(stderr, "WARNING: could not restore player CPU affinity: %s\n",
+                    strerror(errno));
+        } else {
+            fprintf(stderr, "SCHED: player CPU eligibility %d -> %d CPUs "
+                    "before worker creation (launcher unchanged)\n",
+                    CPU_COUNT(&before), CPU_COUNT(&after));
+        }
+    }
     snapshot_available_cpus(&p);
     if (g_debug_stats) {
         fprintf(stderr, "CPUs online %d / configured %d, process affinity: ",
                 p.ncpu_onln, p.ncpu_conf);
         print_cpu_mask(p.cpu_aff_mask);
-        fprintf(stderr, "  (all player threads unpinned)\n");
+        fprintf(stderr, "  (workers inherit this mask)\n");
     }
     if (pktq_init(&p.aq, AUDIO_Q_CAP) < 0 ||
         pktq_init(&p.vq, VIDEO_Q_HARD_CAP) < 0)
@@ -15989,9 +16002,9 @@ int main(int argc, char **argv)
         }
         if (p.uncapped_bench) {
             if (p.video_started && p.sched_demux_cpu < 0)
-                note_unpinned_cpu("demux", &p.sched_demux_cpu);
+                note_inherited_cpu("demux", &p.sched_demux_cpu);
         } else if (p.audio_started && p.video_started && p.sched_demux_cpu < 0) {
-            note_unpinned_cpu("demux", &p.sched_demux_cpu);
+            note_inherited_cpu("demux", &p.sched_demux_cpu);
         }
 
         if (p.uncapped_bench && p.ai >= 0 && pkt->stream_index == p.ai) {
@@ -16304,10 +16317,10 @@ int main(int argc, char **argv)
         print_cpu_mask(p.cpu_aff_mask);
         fprintf(stderr, "]\n");
         fprintf(stderr,
-                "Video affinity:             unpinned  sched_getcpu=%d\n"
+                "Video affinity:             player mask  sched_getcpu=%d\n"
                 "Audio affinity:             not started (benchmark)\n"
-                "Input affinity:             unpinned  sched_getcpu=%d\n"
-                "Demux affinity:             unpinned  sched_getcpu=%d\n",
+                "Input affinity:             player mask  sched_getcpu=%d\n"
+                "Demux affinity:             player mask  sched_getcpu=%d\n",
                 p.sched_video_cpu, p.sched_input_cpu, p.sched_demux_cpu);
         }
     }
@@ -16682,11 +16695,11 @@ int main(int argc, char **argv)
         print_cpu_mask(p.cpu_aff_mask);
         fprintf(stderr, "]\n");
         fprintf(stderr,
-                "Video affinity:             unpinned  sched_getcpu=%d\n"
-                "Audio affinity:             unpinned  sched_getcpu=%d\n"
-                "Present affinity:           unpinned  sched_getcpu=%d\n"
-                "Input affinity:             unpinned  sched_getcpu=%d\n"
-                "Demux affinity:             unpinned  sched_getcpu=%d\n"
+                "Video affinity:             player mask  sched_getcpu=%d\n"
+                "Audio affinity:             player mask  sched_getcpu=%d\n"
+                "Present affinity:           player mask  sched_getcpu=%d\n"
+                "Input affinity:             player mask  sched_getcpu=%d\n"
+                "Demux affinity:             player mask  sched_getcpu=%d\n"
                 "Controller events:          %lu  (print-only, no dvdnav yet)\n",
                 p.sched_video_cpu, p.sched_audio_cpu, p.sched_present_cpu,
                 p.sched_input_cpu, p.sched_demux_cpu, p.ctrl_events);
