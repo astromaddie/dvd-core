@@ -32,7 +32,7 @@
  *   audio  — AC-3 + swr + MrAudio; publishes hardware audio clock
  *   video  — MPEG-2 parser/decode + swscale + mailbox; follows audio clock
  *
- * Queues: audio 32 pkts (~1 s AC-3), video soft 2560 / hard 4096.
+ * Queue experiment: audio 128 pkts (~4 s AC-3), video soft 2560 / hard 4096.
  * Video HOL escape may use 2560–4096 when aq is low. Packets are not dropped.
  *
  * libdvdnav/custom AVIO run only on the demux thread (the AVIO callback is
@@ -122,7 +122,7 @@ enum {
     THR_CLOCK
 };
 
-#define AUDIO_Q_CAP     32
+#define AUDIO_Q_CAP     128
 #define VIDEO_Q_SOFT_CAP 2560
 #define VIDEO_Q_HARD_CAP 4096
 #define VIDEO_Q_CAP     VIDEO_Q_SOFT_CAP
